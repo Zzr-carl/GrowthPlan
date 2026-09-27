@@ -602,8 +602,12 @@ if (!defined('GP_TL_GEOMETRY')) {
            给右缘留 18px 之后，左右各让出约 18px 呼吸位，
            卡片不再顶边、不再溢出，左右宽度也回到同一量级。
            18 这个数 = 左侧卡片本来就有的视觉边距，取齐它。 */
-        1 => [0, '50%', 0, 18, true],
-        2 => [0, '50%', 0, 18, true],
+        /* 主干从 50% 左移到 30%：
+           中线布局下左列常年空着（日志不是每天写），主干停在正中会
+           让「主干 + 右侧卡片」整体显得偏右、左半屏大片留白。
+           用户要求「把整个时间线往左移」，故 rail 收到 30%。 */
+        1 => [0, '18%', 0, 18, true],
+        2 => [0, '18%', 0, 18, true],
         3 => [0, 10,  0, 0, false],
         4 => [0, 10,  0, 0, false],
     ];
@@ -881,7 +885,7 @@ if (!function_exists('gp_render_tl_node')) {
                没有任何折叠交互，读起来和右侧文章卡是同一个「一屏看尽」的节奏。 */
             $hasImages = !empty($images);
             ?>
-            <li class="gp-tl-item gp-tl-node gp-tl-log gp-log side-l"<?php
+            <li class="gp-tl-item gp-tl-node gp-tl-log gp-log side-r"<?php
                 echo ($extra['seg_style'] ?? '') !== ''
                     ? ' style="' . Plugin::e($extra['seg_style']) . '"' : '';
                 ?> data-plan-id="<?php echo (int) ($item['plan_id'] ?? 0); ?>">
@@ -2390,6 +2394,18 @@ html.darkmode .gp-wrap{
   position:relative;
   padding-bottom:12px;
 }
+
+/* 节点卡片收窄：主干左移后右列变很宽，
+   卡片一路铺满会拉出很长的单行文字。用户要求「卡片缩短一大半」，
+   这里统一给个上限（约原来的一半），靠左排、右侧留白。 */
+.gp-tl-card,
+.gp-tl-details{
+  max-width:390px;
+}
+.gp-tl-item.side-c > .gp-tl-card,
+.gp-tl-item.side-c > details > .gp-tl-card{
+  max-width:none;   /* 首尾路牌是内容撑宽 + 居中骑线，不受此限制 */
+}
 .gp-tl-item:last-child{ padding-bottom:0; }
 
 /* ------------------------------------------------------------------
@@ -2497,7 +2513,7 @@ summary.gp-tl-card{ padding-right:30px; }
 }
 
 /* ------------------------------------------------------------------
-   居中节点（side-c）：卡片中轴对准主干线（首尾路牌挂在线的两端，不压线）
+   居中节点（side-c）：卡片**压在主干线上**，左右各一半
    ------------------------------------------------------------------
    谁用：开始 / 结束。它们是这条线的「头」和「尾」，不属于左右任何一侧，
    放在正中当路牌，读者一眼就知道「这条线从哪儿到哪儿」。
@@ -3021,11 +3037,17 @@ summary.gp-tl-card:hover .gp-tl-chev{ opacity:1; }
      · 日期不再占左侧列，而是贴着卡片右下角
    ------------------------------------------------------------------ */
 .gp-tl-card.is-log{
-  /* 左侧色条用「日志圆点同款的中性灰」，和右侧文章卡（强调色）拉开辨识度。
-     刻意不给日志一个彩色 —— 彩色是「主计划/子计划」用来区分层级的，
-     日志不该参与那套颜色语义。 */
-  border-left:3px solid var(--gp-line-2);
-  padding:9px 12px 8px;
+  /* 日志改用**专属卡片样式**：
+     用户要求「日志卡片也挪到右边，但要用特殊一点的卡片」——
+     现在日志和打卡同处右列，必须一眼能区分开，所以给它：
+       · 左侧一道强调色竖条（不再用中性灰）
+       · 暖色便签底（--gp-bg-soft，Lo-Fi 手帐的纸感）
+       · 不对称圆角（左窄右宽，像一张贴上去的便签）
+       · 正文改斜体感的衬线？—— 不，保持可读，只加左条 + 底色 + 圆角。 */
+  border-left:3px solid var(--gp-accent);
+  background:var(--gp-bg-soft);
+  border-radius:4px 14px 14px 4px;
+  padding:9px 13px 8px;
   gap:7px;
 }
 .gp-tl-card.is-log .gp-tl-text{
