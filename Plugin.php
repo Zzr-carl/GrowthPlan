@@ -1880,17 +1880,20 @@ class Plugin implements PluginInterface
         $flat = [];
 
         /* 已完成的计划不再出现在「关联成长计划」选择器里。
-           已完成的计划就该封账，再挂新文章会让时间线继续变长，语义上也说不通。
+           用户需求：子任务标为已完成后，写文章时不该还能往里加打卡 —— 已完成
+           的计划就该封账，再挂新文章会让时间线继续变长，语义上也说不通。
            判定统一走 self::status()，与后台列表 / 前台时间线显示同一套口径，
            不会出现「后台显示已完成、这里却还能选」的分裂。
            注意：只排除 done，不动 archived —— 归档是另一套独立开关，
-           归档计划按现有设计仍可关联。
+           归档计划按现有设计仍可关联（用户未要求改）。
 
-           ⚠️ 必须过滤**整棵树**，不能只过滤 $roots：
+           ⚠️⚠️ 必须过滤**整棵树**，不能只过滤 $roots：
            planTree() 返回的 $roots 只含 parent_id 为空的根计划，所有子/孙计划
-           都在 $children 里（按 parent_id 索引）。所以先把所有 done 的 id 收进
-           集合，再在下面 $walk 遍历时统一跳过 —— 遍历天然覆盖 roots + children
-           全树，不存在漏层。 */
+           都在 $children 里（按 parent_id 索引）。第一版只写了
+           $roots = $excludeDone($roots)，结果子计划一个都没滤掉 —— 线上实测
+           「kk基础线条」照样出现在选择器里，就是这个原因。
+           现在的做法：先把所有 done 的 id 收进集合，再在 $walk 遍历时统一跳过，
+           遍历天然覆盖 roots + children 全树，不存在漏层。 */
         $doneIds = [];
         foreach ($plans as $plan) {
             if (self::status($plan) === 'done') {

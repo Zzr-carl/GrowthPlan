@@ -508,6 +508,30 @@ if (!function_exists('gp_short_date')) {
     }
 }
 
+if (!function_exists('gp_cn_week')) {
+    /**
+     * 中文星期几：「周三」
+     *
+     * 用户要求日期带上星期，「方便看」——
+     * 打卡是日更，知道是周几比干看日期好对照；计划的起止也一样。
+     * 独立成函数而不是塞进 gp_short_date/cnDate：那俩的返回值有别的
+     * 地方在用（如 datetime 属性、时间线排序展示），不能随便改格式。
+     */
+    function gp_cn_week($date): string
+    {
+        $date = trim((string) $date);
+        if ($date === '') {
+            return '';
+        }
+        $ts = strtotime($date);
+        if ($ts === false) {
+            return '';
+        }
+        $map = ['日', '一', '二', '三', '四', '五', '六'];
+        return '周' . $map[(int) date('w', $ts)];
+    }
+}
+
 /**
  * 时间线的层级几何常量（中线布局：主干居中，记录在左、打卡在右）
  *
@@ -602,10 +626,10 @@ if (!defined('GP_TL_GEOMETRY')) {
            给右缘留 18px 之后，左右各让出约 18px 呼吸位，
            卡片不再顶边、不再溢出，左右宽度也回到同一量级。
            18 这个数 = 左侧卡片本来就有的视觉边距，取齐它。 */
-        /* 主干从 50% 左移到 30%：
+        /* 主干从 50% 一路左移到 **18%**（30% → 18%，分两步调的）：
            中线布局下左列常年空着（日志不是每天写），主干停在正中会
            让「主干 + 右侧卡片」整体显得偏右、左半屏大片留白。
-           用户要求「把整个时间线往左移」，故 rail 收到 30%。 */
+           想让主干回正中，把这两个 '18%' 改回 '50%' 即可。 */
         1 => [0, '18%', 0, 18, true],
         2 => [0, '18%', 0, 18, true],
         3 => [0, 10,  0, 0, false],
@@ -780,34 +804,154 @@ if (!function_exists('gp_render_timeline')) {
                 </span>
             </li>
 
-            <?php foreach ($items as $item): ?>
-                <?php
-                /* 该条目落在哪个子计划的区段里：后开始的覆盖先开始的。
-                   条目无日期 → 不上色（露出默认蓝条纹）。 */
-                $segColor = '';
-                if (null !== $item['ts']) {
-                    foreach ($segBands as $sb) {
-                        if (null !== $sb['start']
-                            && $item['ts'] >= $sb['start']
-                            && (null === $sb['end'] || $item['ts'] <= $sb['end'])) {
-                            $segColor = $sb['color'];
-                        }
+            <?php
+            /* ============================================================
+               主时间线「记录类节点」按周折叠
+               ------------------------------------------------------------
+               为什么：打卡一天一条，实测「画画基本功」78 个打卡**全挤在同一个
+               月里**（2026-09）—— 先做的「按月折叠」对这份数据完全无效（月份数
+               只有 1，达不到折叠阈值）。日更打卡的最小有效分组单位是**周**。
+               按周分组后默认只展开本周，历史周收起成一行摘要，滚动量从 78 张
+               降到二十几张。
+               ⚠️ HTML 体积不会明显下降（节点仍全部渲染，零 JS 架构决定的）——
+                  这个改动主要解决**滚动/导航**，别指望它减肥。
+               实现保持**零 JS**：用原生 <details>，与子计划展开同一套机制。
+               结构上用「<li> 里嵌 <ul>」而不是把节点直接塞进 details ——
+               后者会产生 ul > div > li 的非法嵌套。
+
+               ⚠️ 折叠阈值：depth ≤ 2、记录数 > 6、周数 > 1 才折。
+                  depth 限定 ≤2 是因为 d3/d4 是 2px 细轨布局，6px 的折叠色带
+                  会比轨本身还粗；且那种深度很少攒到十几条记录。
+                  记录数阈值原为 12，用户反馈「速写只有 9 条却没折叠」——
+                  阈值降到 6：够 6 条以上、跨了两周的计划都折，行为可预期；
+                  6 条以下的平铺反而更好读，不值得加一层壳。
+                  ⚠️ 周是**按每条时间线各自算**的（$weekMap 从该线的 $items 构建），
+                  子计划之间互不影响 —— 不要改成跨计划汇总。
+               ⚠️ 只折「记录类」（打卡 post / 日志 log）；子计划、历史轮次、
+                  首尾路牌是结构锚点，必须留在原位。
+               ============================================================ */
+            $recordKinds = ['post', 'log'];
+            $recordItems = [];
+            foreach ($items as $it) {
+                if (in_array((string) $it['kind'], $recordKinds, true)) {
+                    $recordItems[] = $it;
+                }
+            }
+            /* 按 ISO 周（oW）分组：跨年的周也正确，不会把 12 月底和 1 月初混成一团。
+               每组记住首个条目的时间戳，用于算这一周的周一/周日来做摘要文案。 */
+            $weekMap = [];
+            foreach ($recordItems as $it) {
+                $ts = $it['ts'] ?? null;
+                $key = (null !== $ts) ? date('oW', (int) $ts) : '__nodate__';
+                if (!isset($weekMap[$key])) {
+                    $weekMap[$key] = ['items' => [], 'firstTs' => (int) $ts];
+                }
+                $weekMap[$key]['items'][] = $it;
+            }
+            $doFold = ($depth <= 2) && count($recordItems) > 6 && count($weekMap) > 1;
+            /* 默认展开「最新一周」而不是「本周」：打卡可能几周前就停了，
+               按本周算会一组都匹配不到，整条线全收起反而更难看。
+               'oW' 是 YYYYWW 定长格式，字符串排序即时间排序，跨年也正确。 */
+            $latestWeek = '';
+            foreach (array_keys($weekMap) as $wk) {
+                if ($wk !== '__nodate__' && $wk > $latestWeek) {
+                    $latestWeek = $wk;
+                }
+            }
+            $curWeek = date('oW');
+            $doneMonths = [];
+
+            /* 算某条目落在哪个子计划的区段色：后开始的覆盖先开始的。
+               条目无日期 → 不上色（露出默认蓝条纹）。 */
+            $segOf = static function ($ts) use ($segBands): string {
+                if (null === $ts) {
+                    return '';
+                }
+                $color = '';
+                foreach ($segBands as $sb) {
+                    if (null !== $sb['start'] && $ts >= $sb['start']
+                        && (null === $sb['end'] || $ts <= $sb['end'])) {
+                        $color = $sb['color'];
                     }
                 }
-                $segStyle = $segColor !== ''
+                return $color;
+            };
+            $segStyleOf = static function ($color): string {
+                return $color !== ''
                     ? '--gp-seg:repeating-linear-gradient(-45deg, rgba(255,255,255,.32) 0 2px, rgba(255,255,255,0) 2px 5px),'
-                      . $segColor
+                      . $color
                     : '';
-                // ⚠️ 这里必须是 array_merge()，不能写 $ctx + ['depth' => $depth]。
-                //    PHP 的 `+` 对字符串键是**左优先**：左边已有的键不会被右边覆盖。
-                //    而 $ctx 是从上一层透传下来的，里面已经带着上一层的 depth，
-                //    于是「孙计划」那一层拿到的还是 depth=1，渲染出来永远是 d2
-                //    —— 层级压根不递涨，几何/日期列全错，而且完全不报错。
-                //    array_merge() 才是「后者覆盖前者」，这里要的就是覆盖。
+            };
+            ?>
+            <?php foreach ($items as $item): ?>
+                <?php
+                $kind = (string) $item['kind'];
+                if ($doFold && in_array($kind, $recordKinds, true)) {
+                    $ts0 = $item['ts'] ?? null;
+                    $key = (null !== $ts0) ? date('oW', (int) $ts0) : '__nodate__';
+                    if (isset($doneMonths[$key])) {
+                        continue;   // 该月已在首次出现时整组渲染
+                    }
+                    $doneMonths[$key] = true;
+                    $group = $weekMap[$key]['items'];
+                    // 整月色带取组内第一个有日期条目的颜色，保证月份之间不断色
+                    $mColor = '';
+                    foreach ($group as $gi) {
+                        $c = $segOf($gi['ts'] ?? null);
+                        if ($c !== '') { $mColor = $c; break; }
+                    }
+                    if ($key === '__nodate__') {
+                        $mLabel = '无日期记录';
+                    } else {
+                        // 摘要用「周一 - 周日」的日期区间，比「第 N 周」直观
+                        $mon = strtotime('monday this week', $weekMap[$key]['firstTs']);
+                        $sun = strtotime('sunday this week', $weekMap[$key]['firstTs']);
+                        $mLabel = date('n月j日', $mon) . ' - ' . date('n月j日', $sun);
+                    }
+                    // 最新一组默认展开；角标：是本周显「本周」，否则显「最新」
+                    // ⚠️ 必须转字符串再比：$weekMap 的键是 '202642' 这类纯数字串，
+                    //    PHP 会把它们转成**整数键**，array_keys() 拿回来是 int；
+                    //    而 $key 来自 date('oW') 是 string。直接 === 因类型不同恒为 false
+                    //    （实测：两边打印都是 202642，=== 却返回 false）。
+                    $isCur = ((string) $key === (string) $latestWeek);
+                    $badge = ((string) $key === (string) $curWeek) ? '本周'
+                           : (((string) $key === (string) $latestWeek) ? '最新' : '');
+                    ?>
+                    <li class="gp-tl-fold"<?php echo $segStyleOf($mColor) !== '' ? ' style="' . Plugin::e($segStyleOf($mColor)) . '"' : ''; ?>>
+                        <details class="gp-tl-fold-details"<?php echo $isCur ? ' open' : ''; ?>>
+                            <summary class="gp-tl-fold-summary">
+                                <span class="gp-tl-fold-name"><?php echo Plugin::e($mLabel); ?></span>
+                                <span class="gp-tl-fold-count"><?php echo count($group); ?> 条</span>
+                                <?php if ($badge !== ''): ?>
+                                    <span class="gp-tl-fold-cur"><?php echo Plugin::e($badge); ?></span>
+                                <?php endif; ?>
+                            </summary>
+                            <ul class="gp-tl-fold-list">
+                                <?php foreach ($group as $gi): ?>
+                                    <?php
+                                    gp_render_tl_node(
+                                        (string) $gi['kind'],
+                                        $gi['data'],
+                                        array_merge($ctx, [
+                                            'depth'     => $depth,
+                                            'seg_style' => $segStyleOf($segOf($gi['ts'] ?? null)),
+                                        ])
+                                    );
+                                    ?>
+                                <?php endforeach; ?>
+                            </ul>
+                        </details>
+                    </li>
+                    <?php
+                    continue;
+                }
+                ?>
+                <?php
+                /* 非记录类（子计划 / 轮次）或未达折叠阈值：按原逻辑逐条渲染 */
                 gp_render_tl_node(
-                    (string) $item['kind'],
+                    $kind,
                     $item['data'],
-                    array_merge($ctx, ['depth' => $depth, 'seg_style' => $segStyle])
+                    array_merge($ctx, ['depth' => $depth, 'seg_style' => $segStyleOf($segOf($item['ts'] ?? null))])
                 );
                 ?>
             <?php endforeach; ?>
@@ -816,7 +960,7 @@ if (!function_exists('gp_render_timeline')) {
                 <li class="gp-tl-item gp-tl-node gp-tl-empty-node side-r">
                     <span class="gp-tl-dot gp-tl-dot-log" aria-hidden="true"></span>
                     <span class="gp-tl-card is-plain">
-                        <span class="gp-tl-text">这条线还没有任何记录或子计划。</span>
+                        <span class="gp-tl-text">这个计划还是空的 —— 去后台给它加个子计划，或者写下第一条日志吧。</span>
                     </span>
                 </li>
             <?php endif; ?>
@@ -920,6 +1064,10 @@ if (!function_exists('gp_render_tl_node')) {
                         <time class="gp-tl-card-date"
                               datetime="<?php echo Plugin::e($date); ?>"><?php
                             echo gp_short_date($date);
+                            $lwk = gp_cn_week($date);
+                            if ($lwk !== '') {
+                                echo ' ' . Plugin::e($lwk);
+                            }
                         ?></time>
                     <?php endif; ?>
                 </span>
@@ -963,6 +1111,10 @@ if (!function_exists('gp_render_tl_node')) {
                                 <time class="gp-tl-card-date"
                                       datetime="<?php echo Plugin::e($postDate); ?>"><?php
                                     echo gp_short_date($postDate);
+                                    $pwk = gp_cn_week($postDate);
+                                    if ($pwk !== '') {
+                                        echo ' ' . Plugin::e($pwk);
+                                    }
                                 ?></time>
                             <?php endif; ?>
                         </span>
@@ -1069,6 +1221,12 @@ if (!function_exists('gp_render_tl_node')) {
         $subCount = (int) ($extra['child_counts'][$pid] ?? 0);
         $subLogCount = (int) ($extra['log_counts'][$pid] ?? 0);
         $subRounds = $extra['rounds'][$pid] ?? [];
+        // 已完成的子计划**默认收起**。
+        // 理由：完成的支线还占一大块展开面积，主线被压得很难扫读；
+        // 收成一行摘要（标题 + 已完成 + 内容概览），想看点开即可。
+        // 未完成的仍默认展开（看支线进度是主要诉求）。
+        $isDone = ($childStatus === 'done');
+        $ownPostCount = count($extra['posts'][$pid] ?? []);
 
         // 子计划节点默认只显示「日期 + 标题」，
         // 点开（原生 details）才出现它的内容：状态 / 描述 / 进度 / 起止，
@@ -1086,16 +1244,17 @@ if (!function_exists('gp_render_tl_node')) {
             ?>>
             <span class="gp-tl-dot gp-tl-dot-child" aria-hidden="true"></span>
             <?php
-            /* 子计划**默认展开**，而且不给折叠开关。
-               理由：点进计划的人本来就是要看「这条支线做了什么」，
-               再让他多一次点击才能看到内容，纯属多一道手续。
-               所以这里用 <details open> 保留可折叠的语义与可访问性结构
-               （万一以后要改成可折叠，改一个属性即可），但视觉上不出现
-               箭头、也不提示「可点击」——它看起来就是一张铺开的卡片。
+            /* 子计划的默认开合态**按完成状态分流**（2026-10-24 起）：
+                 · 未完成 → 默认展开，不给箭头。点进计划的人本来就是要看
+                   「这条支线做了什么」，多一次点击纯属多一道手续。
+                 · 已完成 → 默认收起，只留一行摘要（标题 + 已完成角标 +
+                   内容概览 + 展开箭头）。完成的支线还铺着占大面积，
+                   主线会被压得很难扫读；收起来想看点开即可。
+               两种情况都保留 <details> 的可折叠语义与可访问性结构。
                ⚠️ 硬约束：<summary> 必须是 <details> 的第一个子元素；
                这里把 summary 做成纯标题行，内容全部放在 .gp-tl-open 里。 */
             ?>
-            <details class="gp-tl-details gp-tl-details-open" open>
+            <details class="gp-tl-details<?php echo $isDone ? '' : ' gp-tl-details-open'; ?>"<?php echo $isDone ? '' : ' open'; ?>>
                 <summary class="gp-tl-card is-open">
                     <?php if ($startRawChild !== ''): ?>
                         <time class="gp-tl-card-date"
@@ -1104,6 +1263,23 @@ if (!function_exists('gp_render_tl_node')) {
                         ?></time>
                     <?php endif; ?>
                     <span class="gp-tl-title"><?php echo Plugin::e($title); ?></span>
+                    <?php if ($isDone): ?>
+                        <?php /* 收起态要给「可点开」的暗示：自绘箭头 + 状态 + 内容概览。
+                                 未完成的默认展开，刻意不给箭头（见下方注释）。 */ ?>
+                        <span class="gp-tl-tag gp-tag-done"><?php
+                            echo Plugin::e(Plugin::statusLabel('done'));
+                        ?></span>
+                        <?php if ($ownPostCount > 0 || $subLogCount > 0 || $subCount > 0): ?>
+                            <?php
+                            $meta = [];
+                            if ($ownPostCount > 0)  { $meta[] = '打卡 ' . $ownPostCount; }
+                            if ($subLogCount > 0)   { $meta[] = '日志 ' . $subLogCount; }
+                            if ($subCount > 0)      { $meta[] = '下级 ' . $subCount; }
+                            ?>
+                            <span class="gp-tl-child-meta"><?php echo Plugin::e(implode(' · ', $meta)); ?></span>
+                        <?php endif; ?>
+                        <span class="gp-tl-chev" aria-hidden="true"></span>
+                    <?php endif; ?>
                 </summary>
                 <div class="gp-tl-open">
                     <div class="gp-tl-sub">
@@ -1208,6 +1384,15 @@ if (!function_exists('gp_render_card')) {
 
         $startCn = Plugin::cnDate($plan['start_date'] ?? null);
         $endCn = Plugin::cnDate($plan['end_date'] ?? null);
+        // 起止日期后附星期几，方便对照周末/工作日安排
+        $startWk = gp_cn_week($plan['start_date'] ?? null);
+        $endWk = gp_cn_week($plan['end_date'] ?? null);
+        if ($startCn !== '' && $startWk !== '') {
+            $startCn .= ' ' . $startWk;
+        }
+        if ($endCn !== '' && $endWk !== '') {
+            $endCn .= ' ' . $endWk;
+        }
         $logCount = (int) ($ctx['log_count'] ?? 0);
         $childCount = (int) ($ctx['child_count'] ?? 0);
         $postCount = (int) ($ctx['post_count'] ?? 0);
@@ -1570,6 +1755,12 @@ if (!function_exists('gp_render_timeline_modal')) {
   --gp-active:#1F7A4C;
   --gp-active-soft:rgba(0,169,92,.14);
   --gp-soon:#B26A1E;
+  /* 折叠角标（最新/本周）专用色。
+     原来直接用 --gp-accent（蓝 #0F6BA8），和 Lo-Fi 纸面暖色调不搭，
+     用户要求改成橘黄。取 --gp-soon 同款的琥珀棕做底、纸面色做字，
+     两色都在主题色谱里，不需要另起炉灶。 */
+  --gp-badge-bg:#B26A1E;
+  --gp-badge-ink:#F8F2E2;
   --gp-soon-soft:rgba(255,108,47,.15);
   --gp-expired:#AF3E2E;
   --gp-expired-soft:rgba(255,102,94,.16);
@@ -1623,6 +1814,10 @@ html.darkmode .gp-wrap{
   --gp-active:#6CC79A;
   --gp-active-soft:rgba(108,199,154,.15);
   --gp-soon:#E0B169;
+  /* 暗色下琥珀本身就是浅色，字必须翻成深墨才够对比
+     （白字配 #E0B169 只有 1.9:1，基本看不见）*/
+  --gp-badge-bg:#E0B169;
+  --gp-badge-ink:#241E17;
   --gp-soon-soft:rgba(224,177,105,.16);
   --gp-expired:#E08F86;
   --gp-expired-soft:rgba(224,143,134,.15);
@@ -2472,6 +2667,114 @@ summary.gp-tl-card{ padding-right:30px; }
 .gp-tl-item.side-r{
   padding-left:calc(var(--gp-rail) + var(--gp-link) + 4.5px);
   padding-right:var(--gp-right-w);
+}
+
+/* ==================================================================
+   按周折叠（主/子时间线的记录类节点）
+   ------------------------------------------------------------------
+   配套 PHP：gp_render_timeline() 把打卡/日志按 ISO 周包进
+   <li class="gp-tl-fold"><details><summary>…</summary><ul>…</ul></details></li>。
+   用 <li> 嵌 <ul> 而不是 div，是为了不产生 ul > div > li 的非法嵌套。
+
+   三条关键点：
+   1. **色带画在整周 li 上**，组内单条的 ::before 关掉 ——
+      否则周边界会出色带断档；由整块画才连续。
+   2. **最新一周默认展开**（PHP 加 open），更早的周收起成一行摘要。
+   3. 摘要是右侧小药丸，位置和节点卡片一致（rail + link 起排）。
+   4. depth ≤ 2 才折（d3/d4 是 2px 细轨，6px 色带会比轨本身还粗）。
+   ================================================================== */
+.gp-tl-fold{
+  position:relative;
+  margin-top:2px;
+}
+/* 整周色带：与 .gp-tl-item::before 同几何（rail-3 / 宽6），铺满整周块 */
+.gp-tl-fold::before{
+  content:"";
+  position:absolute;
+  top:0;
+  bottom:0;
+  left:calc(var(--gp-rail) - 3px);
+  width:6px;
+  background:var(--gp-seg, transparent);
+}
+/* 组内单条不再各自画色带，避免与整周色带重叠 */
+.gp-tl-fold .gp-tl-item::before{ content:none; }
+.gp-tl-fold-list{
+  list-style:none;
+  margin:0;
+  padding:0;
+}
+/* 周摘要：右侧小药丸 */
+.gp-tl-fold-summary{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  margin-left:calc(var(--gp-link) + 4.5px + var(--gp-pad));
+  margin-right:var(--gp-right-w);
+  max-width:390px;
+  padding:6px 12px;
+  background:var(--gp-paper-2);
+  border:1px solid var(--gp-line);
+  border-radius:10px;
+  cursor:pointer;
+  font-size:12px;
+  color:var(--gp-ink-2);
+  list-style:none;
+  user-select:none;
+}
+.gp-tl-fold-summary::-webkit-details-marker{ display:none; }
+.gp-tl-fold-name{ font-weight:600; color:var(--gp-ink); }
+.gp-tl-fold-count{ opacity:.7; font-size:11px; }
+.gp-tl-fold-cur{
+  margin-left:auto;
+  font-size:10px;
+  line-height:1;
+  padding:3px 7px;
+  border-radius:99px;
+  /* 橘黄琥珀色（--gp-badge-bg/ink），跟主题纸面暖调统一；
+     不用 --gp-accent 那个蓝，也和 .gp-tag 的 soft 底语言区分开 ——
+     这是「当前在哪」的高亮标记，需要比状态 tag 更跳。 */
+  background:var(--gp-badge-bg);
+  color:var(--gp-badge-ink);
+  letter-spacing:.02em;
+}
+/* 右端箭头，展开时翻转 */
+.gp-tl-fold-summary::after{
+  content:"\25BE";
+  font-size:9px;
+  opacity:.55;
+  margin-left:2px;
+  transition:transform .18s ease;
+}
+.gp-tl-fold-details[open] > .gp-tl-fold-summary::after{ transform:rotate(180deg); }
+.gp-tl-fold-details[open] > .gp-tl-fold-summary{ background:var(--gp-paper-3); }
+/* ==================================================================
+   已完成的子计划默认收起
+   ------------------------------------------------------------------
+   PHP 侧：gp_render_tl_node() 的 child 分支按 $childStatus 分流 ——
+   已完成的不输出 open、也不加 .gp-tl-details-open，摘要行补一个
+   .gp-tl-chev 自绘箭头 + 「已完成」角标 + 内容概览。
+   未完成的仍默认展开、不给箭头（看支线进度是主要诉求）。
+   ================================================================== */
+/* 收起态给「可点开」的暗示（默认展开的那套刻意是 cursor:default） */
+.gp-tl-child.is-done > .gp-tl-details > summary.gp-tl-card{ cursor:pointer; }
+.gp-tl-child.is-done > .gp-tl-details > summary.gp-tl-card:hover{ border-color:var(--gp-accent); }
+/* 内容概览靠右排在标题后，箭头占右侧 30px 预留位，两者不重叠 */
+.gp-tl-child-meta{
+  margin-left:auto;
+  font-size:11px;
+  color:var(--gp-ink-3);
+  white-space:nowrap;
+}
+/* 收起态的圆点也淡一档，视觉上表达「这条支线已封存」 */
+.gp-tl-child.is-done > .gp-tl-dot-child{ opacity:.5; }
+
+/* 深色模式下给卡片加一道可见边框，解决「卡片和深色弹窗糊在一起」 */
+html.darkmode .gp-tl-card{
+  border:1px solid rgba(255,255,255,.12);
+}
+html.darkmode .gp-tl-card.is-log{
+  border-left:3px solid var(--gp-accent);
 }
 
 /* ------------------------------------------------------------------
